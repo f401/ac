@@ -1,0 +1,141 @@
+libtprt.so 对 libtgpa.so / libtersafe.so 的“解密/解包”分析（静态：IDA 反编译）
+
+结论概览
+1) libtprt.so 的核心能力不是把 .so 从“密文文件”解回“明文文件”，而是典型的运行时解包/内存解密框架：
+   - 通过解析 /proc/self/maps 定位目标 so 在内存中的映射区间；
+   - 通过 mprotect（并带 syscall 直调绕 hook）把目标段临时改成可写；
+   - 对内存段执行 XOR + 分块置换 + 4KB 级别的自定义变换（类似流/块混合变换）；
+   - 刷新 icache / dcache，恢复段权限，令被保护的代码可执行。
+2) 与“目标 so 名称”相关的字符串大量通过自定义字符串表解密（sub_10B060 + off_15D2A8），因此在 .rodata 里看不到完整明文（例如 libtersafe.so 以“ibtersafe.so”方式隐藏，真实字符串从 byte_16B2EC 开始包含前导 'l'）。
+
+一、目标库的触发点（加载/前置处理）
+1) libtersafe.so
+   - sub_C891C (0xC891C)：返回/写入 so 名称指针
+     - 将 (ctx + 0x50) 处的 char* 设为 byte_16B2EC
+     - byte_16B2EC 实际内存为 "libtersafe.so\\0"
+     - 该字符串在字符串表里显示为 "ibtersafe.so"（少 1 字节），实际引用地址使用 0x16B2EC 才能得到完整字符串
+   - sub_44700 (0x44700)：运行时加载 + 调用导出符号
+     - ctx = sub_BDA7C()
+     - file = sub_C9958(ctx, 1)  // 触发前置处理（见 sub_C9958/sub_C9EBC）
+     - sub_455F0(a1, file, ...)  // 内部 dlopen + dlsym + 调用
+   - sub_455F0 (0x455F0)：dlopen / dlsym 调度
+     - file 为空则退回用 sub_C891C(sub_BDA7C()) 获取默认 so 名称
+     - 构造一组符号名（sub_10B060(3090/3067/3113/3136) 等），逐个 dlsym
+     - 成功找到符号后调用 sub_46414(v15, sym_ptr)，随后 dlclose
+   - sub_121C3C (0x121C3C)：另一条 dlopen + dlsym（保存函数指针到对象字段）
+
+2) libtgpa.so
+   - libtprt.so 内未出现明文 “libtgpa.so” 字符串（find_regex/search_text 均未命中）。
+   - 结合字符串解密框架（sub_10B060 / off_15D2A8 / sub_103A04 等）以及 /proc/self/maps 解析逻辑，
+     推断 libtgpa.so 的名称/路径字符串来自加密字符串池运行时解密，因此静态直接搜索不到。
+   - 解包/解密引擎（下文二/三）对“模块基址 + 段描述”工作，并不依赖 .rodata 中存在明文库名；
+     库名通常仅用于在 /proc/self/maps 中筛选目标映射，或用于构造路径/日志字符串。
+
+二、定位目标 so 映射的关键逻辑（/proc/self/maps）
+这部分用于在运行时定位 libtgpa.so / libtersafe.so 等模块映射的 [start,end)、权限、偏移等信息，为后续内存解包做准备。
+
+1) sub_11D930 (0x11D930)：打开 maps 文件并构造读取上下文
+   - path = sub_10B060(661)                // 高概率为 "/proc/self/maps"
+   - fp = sub_11AEF0(path, "rb")
+   - calloc(0x430) 作为“文件读取上下文”，result[0] 保存 fp
+
+2) sub_11B884 (0x11B884)：按行读取（类似 fgets）
+   - 从上述上下文读取一行到 buffer，遇到 '\\n' 截断为 '\\0'
+   - 这是后续 sscanf 解析的输入
+
+3) sub_11D9AC (0x11D9AC)：解析 maps 行并筛选目标模块
+   - format = sub_10B060(1747)             // maps 行 sscanf 格式串（典型形态："%lx-%lx %4s %lx %x:%x %lu %s"）
+   - v2     = sub_10B060(1738)             // 目标关键词/模块名（或其子串），用于在行中匹配
+   - 读取每一行 -> sscanf -> 把解析结果写入 (a1+0x10) 起的结构区（长度 0x420）
+   - 同时提取权限字符（'r'/'w'/'x' 对应 ASCII 114/119/120），写入 a1+1040/1048/1052... 等字段
+   - 该结构随后被用于：
+     - 计算某段的映射起止/偏移
+     - 决定是否对该段做解密/修复
+
+三、内存解密/解包引擎（核心）
+这部分是“解密 libtgpa/libtersafe”的关键：对目标 so 的内存映射段做可写化、变换、刷缓存、恢复权限。
+
+0) 反 hook 的 syscall mprotect（绕过 libc mprotect hook）
+   - sub_11A97C (0x11A97C)：生成可执行 syscall stub
+     - mmap(RW, 0x1000)，把 byte_16A381[0..55] XOR 0x1D 解密得到一段机器码（src）
+     - sub_116934(src, 0x80) 校验，不匹配则 kill(getpid(), 9)
+     - 将回调/函数指针字段写为 sub_11D904（用于 stub 的内部跳转/回调）
+     - memcpy 到 mmap 区，并 sub_116B5C(dest, 1024) 做缓存相关处理
+     - mprotect(dest, 0x1000, RX) 使其可执行
+   - sub_11ABD4 (0x11ABD4)：lazy 初始化并缓存 stub 指针（tp_syscall_imp_0 / qword_19C160）
+   - sub_11AE50 (0x11AE50) + thunk sub_11BDFC (0x11BDFC)：
+     - 若 addr/len 对齐页大小，则走 syscall stub：v7(__NR_mprotect=226, addr, len, prot)
+     - 否则回退 libc mprotect
+
+1) 字节级 XOR 解密（最简单的子算法）
+   - sub_12FA6C (0x12FA6C)：
+     - key_byte = HIWORD(a3)
+     - 若 (a3 & 0x00FF0000)==0 则 key_byte=0x87
+     - 对 [buf, buf+a2) 全部字节做 buf[i] ^= key_byte
+
+2) 0x10000 分块 XOR + 可选置换（更强的子算法）
+   - sub_12FA98 (0x12FA98)：
+     - 对每个 0x10000 chunk：
+       - 先对 chunk 内的 0x4000 区间做 16B 向量 XOR（同样的 key_byte）
+       - 若 a4!=0：把 8 个 0x4000 block 收集到 0x20000 scratch（mmap），
+         再按 v30/v31（由 a4 经移位与 0xF0000000F mask 得到的 8 个索引）把这 8 个 block 重排写回目标位置。
+     - 末尾处理不足整 chunk 的尾部字节：逐字节 XOR
+     - 用完 munmap scratch
+   - 该函数表现出“先统一 XOR，再对固定大小子块做重排”的典型解包特征。
+
+3) 4KB 块级自定义变换（更像主加密/解密核心）
+   - sub_118160 (0x118160)：
+     - 将输入块（<=4096）复制到 v19[4096]
+     - 生成一套字符表：\"\\\"#$%&'()*+,-./0123456789:;<=>?@A\"（可视作自定义字母表/映射表）
+     - 根据 a4 选择 sub_1184A0 或 sub_11877C 生成 v18（类似 key schedule）
+     - 调用 sub_119040(v19, dst=a1, size=a2, v18, v16(S-box/常量), mode=v15) 做核心变换
+   - sub_118360 (0x118360) / sub_118408 (0x118408)：
+     - 先用 sub_118160 对前若干个 0x800(2048) 分块做处理（循环 7 次）
+     - 再对剩余大段调用 sub_12FA98 或 sub_12FA6C 继续处理（不同模式/偏移）
+
+4) 段级 orchestrator（把上面算法应用到目标 so 的映射段）
+   - sub_31D68 (0x31D68)：主调度函数（间接调用，疑似“对某个模块做解包”）
+     - 结合 /proc/self/maps 解析出的基址/段信息，计算需要处理的范围
+     - 通过 sub_11BDFC 临时把段改成可写（prot|2），必要时 madvise
+     - 核心调用 sub_119CC4 -> (sub_118360 或 sub_118408) 执行实际解密/解包
+     - 调用 sub_158198 刷 cache 并恢复 mprotect
+   - sub_31950 (0x31950)：对单个段做处理
+     - 根据页大小(sub_10B090)计算 addr/len 对齐
+     - sub_11BDFC(addr, len, prot|2) -> 写权限
+     - sub_119D20(...)：对段内“编码数据结构/修复表”做解码与指针修复（并更新 qword_19BBD0 等全局）
+     - sub_158198(...) 刷 cache，sub_11BDFC(addr,len,prot) 恢复权限
+   - sub_32D50 (0x32D50)：对内存做“补丁写入/段内拷贝”
+     - mprotect 可写 -> memcpy(a1+56 的数据到目标地址) -> flush -> 恢复
+   - sub_3339C (0x3339C)：批量 mprotect
+     - 遍历 [offset,size,prot] 表，对每段设置 prot|a3
+
+四、与 libtgpa / libtersafe 的关联方式（可落地的判断）
+1) libtersafe
+   - 明确可见的 so 名称：byte_16B2EC = "libtersafe.so"
+   - 触发链：sub_44700 -> sub_C9958 -> sub_C9EBC -> (准备好可 dlopen 的 so 路径/环境) -> sub_455F0(dlopen/dlsym/调用)
+   - 其中 sub_C9EBC 引用了 ".so" 与固定 key 字符串 "Txy*#xP?@xxP6~C"，并调用 /proc/self/maps 读取/解析相关函数，
+     符合“筛选 so 映射 + 解密/修复段”的工作形态。
+
+2) libtgpa
+   - 明文库名未出现在 .rodata 字符串表中；结合字符串池解密机制判断：库名/路径来自 sub_10B060 运行时解密。
+   - 解密/解包引擎（sub_31D68/sub_31950/sub_119CC4/sub_12FA98/sub_12FA6C/sub_118160/sub_119040 等）
+     是“对任意模块映射段”工作的通用实现，因此同一套逻辑可用于 libtgpa.so 与 libtersafe.so。
+   - 需要把 libtgpa.so 与 maps 行匹配起来时，通常会通过 sub_10B060 得到其名称/路径子串（静态无法直接从明文串定位）。
+
+五、建议在动态验证时观察的关键点（用于进一步坐实 libtgpa 关联）
+1) 在 sub_11D9AC 的匹配关键词（sub_10B060(1738)/sub_10B060(1781) 等）解密后，确认是否包含 "libtgpa.so"/"libtersafe.so"。
+2) 在 sub_31D68 调用 sub_119CC4 前，记录其参数 (a1=base, a2=size, a3=key, a4=perm)：
+   - 不同目标 so 通常 key/perm 不同；
+   - 这些参数决定 sub_12FA98 的 XOR key_byte 与重排索引来源。
+
+附：关键符号/地址速查
+- JNI_OnLoad: 0x25D1C
+- libtersafe.so 字符串: byte_16B2EC (0x16B2EC) = "libtersafe.so"
+- 获取 libtersafe.so 名称: sub_C891C (0xC891C)
+- 前置处理（含 ".so"、key 字符串引用）: sub_C9EBC (0xC9EBC)；包装调用 sub_C9958 (0xC9958)
+- dlopen/dlsym 加载调用: sub_455F0 (0x455F0)、sub_121C3C (0x121C3C)
+- /proc/self/maps：打开 sub_11D930 (0x11D930)，读行 sub_11B884 (0x11B884)，解析 sub_11D9AC (0x11D9AC)
+- syscall mprotect stub：sub_11A97C (0x11A97C)，缓存 sub_11ABD4 (0x11ABD4)，包装 sub_11AE50 (0x11AE50)/sub_11BDFC (0x11BDFC)
+- 解密原语：sub_12FA6C (0x12FA6C)，sub_12FA98 (0x12FA98)，sub_118160 (0x118160)，sub_118360 (0x118360)，sub_118408 (0x118408)
+- 段级解包：sub_31D68 (0x31D68)，sub_31950 (0x31950)，sub_32D50 (0x32D50)，sub_3339C (0x3339C)
+

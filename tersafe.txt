@@ -1,0 +1,50 @@
+libtersafe.so 环境检测逻辑汇总（按模块归类）
+
+一、反调试 / 进程跟踪（ptrace / wait / signal）
+sub_26254C：对目标 pid 执行 ptrace(PTRACE_ATTACH)；以是否成功作为“可被附加/是否已被其他调试器占用”的判断入口（控制流混淆，结果通过间接跳转分发）。
+sub_262AAC：对目标 pid 执行 ptrace(PTRACE_DETACH)；用于在探测或跟踪流程结束后解除附加（控制流混淆，结果通过间接跳转分发）。
+sub_262844：针对不同 request/事件分支执行 ptrace(PTRACE_CONT) 或 sub_262AAC（DETACH）；属于“被跟踪进程事件处理/继续运行”的调度逻辑（混淆较重）。
+sub_262C7C：对 pid 发送 SIGSTOP(19) → waitpid → ptrace(PTRACE_DETACH) → SIGCONT(18)；用于“暂停-同步-解除跟踪-恢复”流程，常见于自跟踪/反调试管控。
+sub_269C38：核心反调试/自跟踪入口之一：ptrace(PTRACE_ATTACH) 附加目标 pid，waitpid 等待其停止后使用 ptrace(PTRACE_SYSCALL) 驱动；失败或状态异常会写入状态码并 DETACH，体现“检测是否可附加/驱动系统调用跟踪”的能力。
+sub_269484：对目标 pid 执行 ptrace(PTRACE_GETREGSET) 读取寄存器集，并检查 0xBEEF0000 魔数与 173 等字段；命中后可能触发 sub_269520 对寄存器进行修正，体现“通过寄存器/约定魔数进行通信或反调试控制”的逻辑。
+sub_269520：对目标 pid 执行 ptrace(PTRACE_SETREGSET) 写回寄存器集；在 sub_269484 的条件满足时用于修改寄存器状态（可能用于跳过/修复/对抗外部跟踪）。
+sub_269590：对目标 pid 执行 ptrace(PTRACE_SETREGSET, request=1028, …) 写入 4 字节数据；更像是设置某类调试/寄存器相关参数（具体含义取决于内核/架构实现）。
+sub_269864：设置 *(ctx+116)=6（并伴随 pid/stat_loc/options/request 等注释痕迹）；属于 ptrace/wait 相关状态机的一环（反调试流程的内部状态推进，反编译不完整）。
+sub_26B414：将字符串参数解析为 pid（atoi），尝试 ptrace(PTRACE_ATTACH)；若附加失败走错误分支，附加成功则 waitpid 并调用 sub_26B740 两次后 DETACH；属于“对指定 pid 的可附加性/状态读取”检测。
+sub_26B740：与 sub_26B414 配套的混淆分发节点（根据 pid/参数决定后续分支）；用于反调试探测流程内部调度。
+sub_262648：调用 sub_262AAC 的调度/包装（反编译不完整）；属于 ptrace 流程中的控制流拼接点。
+
+二、系统调用完整性 / 父进程关联检查（syscall / getppid）
+sub_269E78：syscall 包装器：当未开启某标志位时直接 syscall(sysno, …)；否则会缓存 getppid() 并发起 syscall(173, …, (sysno|0xBEEF0000), …) 的“带魔数调用”，若返回值与缓存的父进程 pid 相等且 sysno != 48879 则返回 -1。该结构体现“对系统调用链路进行一致性/反拦截检测”的意图（可用于发现被劫持的 syscall 路径或异常环境）。
+sub_261988：调用 prctl(PR_SET_DUMPABLE=4, 1, 0, 0, 0)，并将结果写入 *(ctx+2166)；通常用于调整进程可被 ptrace/生成 core 的行为，配合自跟踪/反调试机制使用。
+sub_26C0C0：调用 prctl(PR_SET_DUMPABLE=4, 1, 0, 0, 0) 后继续执行字符串/命令拼装与后续调用；体现“先调整 dumpable 再执行后续安全/检测流程”的初始化步骤（其余逻辑反编译不完整）。
+
+三、Hook / 篡改检测（函数指针基线 + inline hook）
+sub_25B144：构建一份需要被关注的函数指针清单（open/read/write/fopen/fread/fgets/fseek/readdir/syscall/access/stat/fstat/getenv/kill/gettimeofday/sleep/select/connect/send/recv/opendir/ptrace/execl/clock_gettime/fdopen/getpid/dlopen/dlclose/pthread_create/fork/mmap，以及 tss_sdk_init 等）。这类清单通常用于“检测关键 API 是否被 inline hook/PLT hook/重定向”或用于后续一致性校验。
+sub_25B464：将单个函数指针节点分配并插入到链表结构中（为 sub_25B144 的清单构建提供基础）。
+sub_3FD4A0：inline hook 检测/处理的核心大函数（通过字符串可见特征包括：inline_hook_opcode_dismatch、set_inline_hook_error、ms_set_inlie_hook、ms_hook_opcode 等）；典型用途是校验目标函数入口指令序列是否被篡改、发现异常时记录错误并进入补救/上报流程（反编译输出过长且被截断，但从字符串与结构可确认其为 inline hook 检测模块）。
+sub_28F32C：以 &ptrace 为输入，结合 sub_4EA6A8(31359) 的条件分支将 ptrace 指针交给某分发表处理；属于“对 ptrace 指针/调用路径进行校验或差异化处理”的一环（可视作反 hook 逻辑的组成部分）。
+
+四、硬件/系统属性与能力检测（__system_property_get / getauxval / uname）
+sub_5097C0：读取 getauxval(0x10) 并检查位 0x100；满足条件后读取系统属性 ro.arch 并与 “exynos9810” 比较，设置全局 byte_577FA8 标志。该逻辑用于“基于硬件能力 + SoC/架构标识进行环境分支/兼容性开关控制”。
+sub_509DF4：一次性初始化逻辑：读取 ro.arch，若为空或不等于 “exynos9810”，则读取 getauxval(0x10) 与 getauxval(0x1A)，并将组合后的标志传入 sub_509858；用于“根据硬件能力/平台信息初始化某项底层能力或保护机制”（具体效果取决于 sub_509858）。
+sub_2CC0F4：调用 uname() 获取系统信息，并将结果与解密得到的格式字符串通过 sub_4A54A4 拼装输出；用于“采集内核/系统版本信息”的环境信息采集逻辑（可能用于上报或策略分支）。
+
+五、文件系统/运行环境路径判断（Android 沙箱路径特征）
+sub_273DC0：对路径 “/data/data” 执行存在性检查（通过 sub_4B897C）；可用于“确认 Android 典型沙箱目录是否存在/环境是否符合预期”。
+sub_273F20：与 “/data/data” 相关的分支逻辑（包含对 file/buf 的处理与对 sub_4B8A1C 的调用，混淆较重）；属于“围绕 Android 沙箱路径的进一步判断/分流”。
+sub_3D7DDC：通过 getpid 与 sub_3D59FC 获取当前进程标识（并在 ':' 处分隔），拼装 “/data/data/%s/files”；用于定位应用私有目录（属于运行环境信息/路径推导）。
+sub_4CF084：与 sub_3D7DDC 类似，拼装 “/data/user/10/%s/files”；用于多用户/特定 userId 下的应用私有目录推导（属于运行环境信息/路径推导）。
+
+六、网络环境探测（socket + 外部命令获取路由）
+sub_24F3EC：创建 socket(AF_INET=2, SOCK_DGRAM=2, IPPROTO_UDP=17)；用于验证网络栈可用性或为后续网络信息获取做准备（控制流混淆，结果通过间接跳转分发）。
+sub_24F46C：对 fd 执行 setsockopt(fd, SOL_SOCKET=1, optname=2, optval=1)；典型为设置 SO_REUSEADDR 等 socket 选项，用于网络探测流程的 socket 初始化。
+sub_24F984：通过 popen 执行外部命令并读取输出；命令字符串经解密后为：ip route get 8.8.8.8 2>&1，模式为：r。该逻辑用于获取默认路由/出接口等信息（可用于网络环境识别，例如出网接口、路由异常、受限网络等）。
+sub_24EE38：网络探测流程的编排/状态机入口：根据多个开关位与参数，循环调用 sub_24F3EC 等子流程，最多尝试 5 次；用于对网络相关环境信息进行综合判断（反编译输出被截断，但从结构可确认其为 orchestrator）。
+
+七、字符串解密支撑（用于隐藏环境检测的关键常量/命令/格式串）
+sub_4E4A30：返回加密字符串表基址（&unk_FBBB0）。
+sub_4E4A44：返回解密缓存区/状态基址（&unk_568FC4）。
+sub_4E6498：字符串解密算法变体 A（每字节 key 以 +i+7 更新）；用于恢复如 popen 模式等明文（示例：offset=0 解密得到 “r”）。
+sub_4E6904：字符串解密算法变体 B（每字节 key 以 ((key+i)^4)+3 更新）；用于恢复如网络探测命令等明文（示例：offset=43604 解密得到 “ip route get 8.8.8.8 2>&1”）。
+
